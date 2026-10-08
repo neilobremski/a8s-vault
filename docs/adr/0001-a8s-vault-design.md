@@ -258,8 +258,10 @@ calls that `/help recipe` prints, so agents without the CLI aren't blocked.
    current connect key of an authenticated session.
 2. ~~**Signed overwrite/delete**~~: resolved by ADR 0002. A sealed command
    inside an authenticated session authorises it.
-3. **Overwrite semantics:** replace, refuse (`--force` to replace), or keep N
-   versions?
-4. **Run-as:** is a dedicated Unix user acceptable as the recommended
-   deployment?
-5. **Seat name and host:** `vault` on which machine (and which network)?
+3. ~~**Overwrite semantics**~~: decided. `/store` overwrites by default, with
+   no force flag.
+4. ~~**Run-as**~~: decided. The recommended deployment runs the vault as a
+   dedicated Unix user, so other agents cannot tamper with its key, its data
+   or its code.
+5. **Seat name and host:** left to the deployment. This is tested in a
+   simulated Docker network (`sim/`).

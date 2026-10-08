@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+echo `# <#` >/dev/null
+
+set -euo pipefail
+
+# A symlink onto PATH must resolve to the repo, not to the symlink's own
+# directory. readlink without -f, in a loop: macOS ships bash 3.2 and BSD
+# readlink, and both handle this form.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+exec python3 "$SCRIPT_DIR/src/__main__.py" "$@"
+#> > $null
+
+$ScriptPath = $PSCommandPath
+if (-not $ScriptPath) { $ScriptPath = $MyInvocation.MyCommand.Path }
+if (-not $ScriptPath) { $ScriptPath = Join-Path (Get-Location) "a8s-vault" }
+
+$ScriptDir = Split-Path -Parent $ScriptPath
+$Entry = Join-Path $ScriptDir "src/__main__.py"
+
+$Python = Get-Command python3 -ErrorAction SilentlyContinue
+if ($Python) { & $Python.Source $Entry @args; exit $LASTEXITCODE }
+$Python = Get-Command python -ErrorAction SilentlyContinue
+if ($Python) { & $Python.Source $Entry @args; exit $LASTEXITCODE }
+$Python = Get-Command py -ErrorAction SilentlyContinue
+if ($Python) { & $Python.Source -3 $Entry @args; exit $LASTEXITCODE }
+
+Write-Error "Could not find python3, python, or py on PATH."
+exit 127

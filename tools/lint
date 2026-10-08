@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Run ruff in a venv beside it, so it never lands in the system or Homebrew
+# python. Arguments pass through: tools/lint --fix src
+#
+# The version is the one in tools/ruff-version.txt, which both workflows
+# install from as well — a lint gate that answers differently on a desk and in
+# CI is not a gate. Bump that file to move all three.
+set -euo pipefail
+
+TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$TOOLS_DIR/.." && pwd)"
+VENV="$TOOLS_DIR/.venv"
+PINNED="$(tr -d '[:space:]' < "$TOOLS_DIR/ruff-version.txt")"
+
+if [ ! -x "$VENV/bin/ruff" ] || [ "$("$VENV/bin/ruff" --version)" != "ruff $PINNED" ]; then
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install --quiet --upgrade pip
+  "$VENV/bin/pip" install --quiet "ruff==$PINNED"
+fi
+
+exec "$VENV/bin/ruff" check "$REPO_DIR/src" "$REPO_DIR/tests" --exclude tests/.venv "$@"

@@ -219,3 +219,5 @@ Considered and rejected for v1:
   out-of-band identifier.
 - The network's access credentials are the security boundary. A remote
   with no credentials is out of scope.
+- `/store` **overwrites** an existing name by default, with no force flag.
+- The recommended deployment runs the vault as a **dedicated Unix user**.
