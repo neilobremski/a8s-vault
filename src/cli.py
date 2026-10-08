@@ -143,6 +143,9 @@ def main(argv=None):
             if args.action == "auth" and not (args.voucher or args.voucher_file):
                 parser.error("client auth needs --voucher or --voucher-file")
             return _client(args)
+    except client.StaleReply as exc:
+        print(f"a8s-vault: {exc}", file=sys.stderr)
+        return 3
     except (vaultlib.VaultError, client.ClientError, crypto.CryptoError, OSError) as exc:
         print(f"a8s-vault: {exc}", file=sys.stderr)
         return 1

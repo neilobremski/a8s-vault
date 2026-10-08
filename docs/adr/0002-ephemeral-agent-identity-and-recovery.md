@@ -197,6 +197,11 @@ Considered and rejected for v1:
    the previous key.
 5. **Same-host compromise of the vault user** exposes everything (ADR 0001
    G6). A dedicated Unix user is still recommended.
+- **Key material on argv.** `openssl enc` only takes a raw AES key as `-K`
+  on its command line, so on a shared host another Unix user can read a
+  per-message key from `/proc/<pid>/cmdline` while it runs. The dedicated user
+  protects files, not process listings: give the vault its own container or
+  VM, or mount `/proc` with `hidepid=2`.
 
 ## 5. Prototype evidence (OpenSSL 3.0.2 and LibreSSL 3.3.6, both directions)
 

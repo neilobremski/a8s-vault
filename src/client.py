@@ -15,6 +15,10 @@ class ClientError(Exception):
     pass
 
 
+class StaleReply(ClientError):
+    """Sealed to an earlier connection key, e.g. the vault's notice to a wiped VM's old key."""
+
+
 def state_dir():
     return os.environ.get("A8S_VAULT_CLIENT") or os.path.expanduser("~/.cache/a8s-vault-client")
 
@@ -119,7 +123,7 @@ def open_reply(message, out_dir=None, save_voucher=None, extra_files=()):
     try:
         payload = json.loads(crypto.open_sealed(_path("conn.key"), crypto.from_wire(text)))
     except crypto.CryptoError as exc:
-        raise ClientError(f"cannot open reply with the current connection key: {exc}") from exc
+        raise StaleReply(f"not sealed to the current connection key; ignore it ({exc})") from exc
     if not crypto.verify(_pinned(), payload["body"].encode(), base64.b64decode(payload["sig"])):
         raise ClientError("reply signature does not verify against the pinned vault key")
     reply = json.loads(payload["body"])
