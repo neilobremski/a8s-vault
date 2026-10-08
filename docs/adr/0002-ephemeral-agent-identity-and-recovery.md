@@ -203,6 +203,15 @@ Considered and rejected for v1:
   protects files, not process listings: give the vault its own container or
   VM, or mount `/proc` with `hidepid=2`. Accepted as-is for v1; hardening (keying
   `enc` without argv) is deferred until the vault has run for real.
+- **Request and reply binding (added after review).** The fingerprint
+  inside a sealed command is of a *public* key, so it proves nothing about
+  who sent it. Each request is therefore `{"req": <json>, "sig": <base64>}`
+  with `sig` made by the connection private key; the vault verifies it against
+  `conn_pem` before dispatching. Each signed reply echoes the request nonce,
+  and `/retrieve` replies carry the sha256 of every sealed attachment. The
+  client keeps its outstanding nonces, refuses a reply it did not ask for or
+  has already applied (so a delayed duplicate cannot rewind the saved voucher),
+  and writes nothing unless every declared attachment is present and matches.
 
 ## 5. Prototype evidence (OpenSSL 3.0.2 and LibreSSL 3.3.6, both directions)
 

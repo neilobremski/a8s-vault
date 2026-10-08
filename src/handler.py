@@ -28,9 +28,11 @@ Everything except /help, /public-key and /connect must be SEALED.
 2. tell {seat} --attach me.pem /connect         -> a throwaway RSA public key (>=2048 bits).
    Replies are sealed to it from now on. A new /connect wipes the old session.
 3. tell {seat} "A8SV1:<base64 of a blob sealed to vault.pem>"
-   The blob's plaintext is JSON:
+   The blob's plaintext is {{"req":"<request JSON>", "sig":"<base64 SHA-256 signature of
+   that exact string by me.pem's private key>"}}, where the request JSON is:
      {{"v":1, "cmd":"/authenticate <voucher>", "conn":"<sha256 of me.pem DER>",
       "ts":"<UTC ISO-8601>", "nonce":"<random hex>", "files":{{"<attachment>":"<sha256>"}}}}
+   Replies echo the nonce and, for /retrieve, the sha256 of each sealed attachment.
    /authenticate burns the voucher and returns the next one. Save it before anything else.
 
 Sealed commands, once authenticated:
@@ -54,7 +56,9 @@ RECIPE = """Seal (sh + openssl or LibreSSL; <pub.pem> <in> <out>):
 Wire body: printf 'A8SV1:%s' "$(openssl base64 -A -in OUT)"
 Open: reverse it. Line 2 unwraps with pkeyutl -decrypt, then check the line-3 HMAC over the
 ciphertext BEFORE decrypting. Replies are JSON {{"body":"<json>","sig":"<base64>"}};
-verify sig (dgst -sha256 -verify vault.pem) over body."""
+verify sig (dgst -sha256 -verify vault.pem) over body, check body.nonce is one you sent and
+have not yet consumed, and check each attachment's sha256 against body.files before opening.
+Sign requests the same way: openssl dgst -sha256 -sign me.key over the request JSON."""
 
 
 def split_message(message):
@@ -165,7 +169,9 @@ class Wake:
             return self.send(f"{self.seat}: no connection for {self.who}; /connect first")
         try:
             blob = crypto.from_wire(self.text.split()[0])
-            req = json.loads(crypto.open_sealed(v.key_path, blob))
+            outer = json.loads(crypto.open_sealed(v.key_path, blob))
+            signed, sig = outer["req"], base64.b64decode(outer["sig"])
+            req = json.loads(signed)
             cmd, conn, nonce = req["cmd"], req["conn"], str(req["nonce"])
             ts = datetime.strptime(req["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         except (crypto.CryptoError, ValueError, KeyError, TypeError) as exc:
@@ -174,6 +180,9 @@ class Wake:
         if conn != row["conn_fpr"]:
             return self.send(f"{self.seat}: sealed for a different connection; /connect again")
         pem = row["conn_pem"]
+        if not crypto.verify(pem.encode(), signed.encode(), sig):
+            return self.send(f"{self.seat}: request signature does not verify against the "
+                             "current connection key; /connect again")
         if abs(time.time() - ts.timestamp()) > vaultlib.TS_WINDOW or not 16 <= len(nonce) <= 128:
             return self.send(_sealed_reply(v, pem, {"ok": False, "cmd": cmd,
                                                     "error": "stale timestamp or bad nonce"}))
@@ -196,6 +205,7 @@ class Wake:
                 traceback.print_exc(file=sys.stderr)
                 result = {"ok": False, "error": f"internal error: {type(exc).__name__}"}
             result["cmd"] = cmd.split()[0] if cmd.split() else cmd
+            result["nonce"] = nonce
             reply = _sealed_reply(v, pem, result)
             v.nonce_put(self.who, nonce, digest, None if files else reply)
         return self.send(reply, files)
@@ -240,10 +250,12 @@ class Wake:
             plain = v.retrieve(who, name)
             attach = name.replace("/", "__") + ".enc"
             path = os.path.join(self.outdir, attach)
+            sealed = crypto.seal(v.session(who)["conn_pem"].encode(), plain)
             with open(path, "wb") as handle:
-                handle.write(crypto.seal(v.session(who)["conn_pem"].encode(), plain))
+                handle.write(sealed)
             out_files.append(path)
-            return {"files": {attach: name}}
+            return {"files": {attach: {"name": name,
+                                       "sha256": hashlib.sha256(sealed).hexdigest()}}}
         if op == "/delete":
             v.delete(who, args[0])
             return {"deleted": args[0]}

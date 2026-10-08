@@ -8,7 +8,7 @@ import tempfile
 import time
 
 import crypto
-from handler import ATTACHED, split_message
+from handler import ATTACHED, UNAVAILABLE, split_message
 
 
 class ClientError(Exception):
@@ -68,7 +68,7 @@ def pin(pem_path, expected=None):
 def connect(to):
     _pinned()
     _ensure_dir()
-    for name in ("conn.key", "conn.pem"):
+    for name in ("conn.key", "conn.pem", "pending.json"):
         if os.path.exists(_path(name)):
             os.unlink(_path(name))
     crypto.generate_key(_path("conn.key"))
@@ -76,6 +76,19 @@ def connect(to):
         handle.write(crypto.public_pem(_path("conn.key")))
     _tell(to, "/connect", [_path("conn.pem")])
     return crypto.fingerprint(crypto.public_pem(_path("conn.key")))
+
+
+def _pending(update=None):
+    """Nonces of requests sent on this connection whose reply has not been applied yet."""
+    path = _path("pending.json")
+    try:
+        with open(path) as handle:
+            nonces = json.load(handle)
+    except (FileNotFoundError, ValueError):
+        nonces = []
+    if update is not None:
+        _save_atomic(path, json.dumps(update(nonces)))
+    return nonces
 
 
 def seal_command(cmd, file_path=None):
@@ -96,7 +109,11 @@ def seal_command(cmd, file_path=None):
     req = {"v": 1, "cmd": cmd, "conn": crypto.fingerprint(crypto.public_pem(_path("conn.key"))),
            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "nonce": os.urandom(16).hex(), "files": declared}
-    return crypto.to_wire(crypto.seal(vault_pem, json.dumps(req).encode())), files
+    signed = json.dumps(req)
+    sig = base64.b64encode(crypto.sign(_path("conn.key"), signed.encode())).decode()
+    _pending(lambda nonces: [*nonces[-200:], req["nonce"]])
+    payload = json.dumps({"req": signed, "sig": sig}).encode()
+    return crypto.to_wire(crypto.seal(vault_pem, payload)), files
 
 
 def send(to, cmd, file_path=None):
@@ -116,7 +133,7 @@ def _save_atomic(path, text):
 
 def open_reply(message, out_dir=None, save_voucher=None, extra_files=()):
     """Verify and decrypt one reply. Returns (reply dict | None, plaintext, written paths)."""
-    text, files, _ = split_message(message)
+    text, files, missing = split_message(message)
     files = list(files) + list(extra_files)
     if not text.startswith(crypto.WIRE):
         return None, text, []
@@ -127,19 +144,22 @@ def open_reply(message, out_dir=None, save_voucher=None, extra_files=()):
     if not crypto.verify(_pinned(), payload["body"].encode(), base64.b64decode(payload["sig"])):
         raise ClientError("reply signature does not verify against the pinned vault key")
     reply = json.loads(payload["body"])
+    nonce = reply.get("nonce")
+    if nonce is None:
+        if reply.get("op") not in ("connect", "disconnected"):
+            raise ClientError("reply carries no request nonce; ignoring it")
+    elif nonce not in _pending():
+        raise ClientError("reply does not match an outstanding request (replayed, or already "
+                          "applied); nothing changed")
+    mapping = reply.get("files") if isinstance(reply.get("files"), dict) else {}
+    outputs = _verified_attachments(mapping if reply.get("cmd") == "/retrieve" else {},
+                                    files, missing, out_dir or ".")
+    if nonce is not None:
+        _pending(lambda nonces: [n for n in nonces if n != nonce])
     if save_voucher and reply.get("voucher"):
         _save_atomic(save_voucher, reply["voucher"])
     written = []
-    mapping = reply.get("files") if isinstance(reply.get("files"), dict) else {}
-    for path in files:
-        name = mapping.get(os.path.basename(path))
-        if not name:
-            continue
-        target = os.path.join(out_dir or ".", name)
-        if os.path.relpath(target, out_dir or ".").startswith(".."):
-            raise ClientError(f"refusing to write outside the output directory: {name}")
-        with open(path, "rb") as handle:
-            plain = crypto.open_sealed(_path("conn.key"), handle.read())
+    for target, plain in outputs:
         os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
         with open(target, "wb") as handle:
             handle.write(plain)
@@ -147,4 +167,31 @@ def open_reply(message, out_dir=None, save_voucher=None, extra_files=()):
     return reply, None, written
 
 
-__all__ = ["ATTACHED", "ClientError", "connect", "open_reply", "pin", "seal_command", "send"]
+def _verified_attachments(mapping, files, missing, out_dir):
+    """Every attachment the signed reply declares must be present and match its sha256."""
+    by_name = {os.path.basename(p): p for p in files}
+    outputs, problems = [], []
+    for attach, info in mapping.items():
+        name = info.get("name") if isinstance(info, dict) else None
+        want = info.get("sha256") if isinstance(info, dict) else None
+        path = by_name.get(attach)
+        if not (name and want and path):
+            state = "unavailable" if attach in missing else "missing"
+            problems.append(f"{attach} ({state})")
+            continue
+        with open(path, "rb") as handle:
+            sealed = handle.read()
+        if hashlib.sha256(sealed).hexdigest() != want:
+            problems.append(f"{attach} (sha256 does not match the signed reply)")
+            continue
+        target = os.path.join(out_dir, name)
+        if os.path.relpath(target, out_dir).startswith(".."):
+            raise ClientError(f"refusing to write outside the output directory: {name}")
+        outputs.append((target, crypto.open_sealed(_path("conn.key"), sealed)))
+    if problems:
+        raise ClientError("retrieval incomplete, nothing written: " + ", ".join(problems))
+    return outputs
+
+
+__all__ = ["ATTACHED", "UNAVAILABLE", "ClientError", "connect", "open_reply", "pin",
+           "seal_command", "send"]

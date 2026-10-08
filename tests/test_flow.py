@@ -1,6 +1,9 @@
 """End-to-end through handler + client with a fake `tell` that records what it would send."""
+import base64
+import json
 import os
 import stat
+import time
 
 import pytest
 
@@ -156,3 +159,66 @@ def test_tamper_rejected(env):
     bad = blob[:-1] + bytes([blob[-1] ^ 1])
     with pytest.raises(crypto.CryptoError):
         crypto.open_sealed(v.key_path, bad)
+
+
+def _authed(tmp_path, v, seat="neil"):
+    with v.db:
+        voucher = v.issue(seat)
+    connect(tmp_path, seat)
+    assert agent_send(tmp_path, seat, f"/authenticate {voucher}")[0]["ok"]
+
+
+def test_unsigned_command_from_forged_seat_is_refused(env):
+    """Knowing the (public) connection fingerprint is not possession of the key."""
+    tmp_path, v = env
+    _authed(tmp_path, v)
+    src = tmp_path / "f.txt"
+    src.write_text("keep me")
+    assert agent_send(tmp_path, "neil", "/store f.txt", str(src))[0]["ok"]
+    req = {"v": 1, "cmd": "/delete f.txt", "conn": v.session("neil")["conn_fpr"],
+           "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "nonce": "ff" * 16, "files": {}}
+    for sig in ("", "AAAA"):   # no signature, and a signature not made by the connection key
+        signed = json.dumps(req)
+        other = crypto.sign(v.key_path, signed.encode()) if sig else b""
+        body = json.dumps({"req": signed, "sig": base64.b64encode(other).decode()}).encode()
+        _, reply = wake(tmp_path, "neil", crypto.to_wire(crypto.seal(v.pub_pem, body)))
+        assert "signature does not verify" in reply
+    assert [f["name"] for f in v.list_files("neil")] == ["f.txt"]
+
+
+def test_substituted_attachment_is_refused(env):
+    tmp_path, v = env
+    _authed(tmp_path, v)
+    src = tmp_path / "private.pem"
+    src.write_text("real key")
+    assert agent_send(tmp_path, "neil", "/store private.pem", str(src))[0]["ok"]
+    body, _ = client.seal_command("/retrieve private.pem")
+    _, reply = wake(tmp_path, "neil", body)
+    path = next(ln.split(": ", 1)[1] for ln in reply.splitlines() if ln.startswith("ATTACHED"))
+    conn_pem = v.session("neil")["conn_pem"].encode()
+    with open(path, "wb") as handle:
+        handle.write(crypto.seal(conn_pem, b"ATTACKER_REPLACEMENT"))   # valid seal, wrong bytes
+    with pytest.raises(client.ClientError, match="sha256 does not match"):
+        client.open_reply(reply, out_dir=str(tmp_path / "got"))
+    assert not (tmp_path / "got" / "private.pem").exists()
+    reply_missing = "\n".join(ln for ln in reply.splitlines() if not ln.startswith("ATTACHED"))
+    with pytest.raises(client.ClientError, match="missing"):
+        client.open_reply(reply_missing, out_dir=str(tmp_path / "got"))
+
+
+def test_replayed_auth_reply_does_not_rewind_voucher(env):
+    tmp_path, v = env
+    with v.db:
+        voucher = v.issue("neil")
+    connect(tmp_path, "neil")
+    body, _ = client.seal_command(f"/authenticate {voucher}")
+    _, first = wake(tmp_path, "neil", body)
+    saved = tmp_path / "voucher"
+    data, _, _ = client.open_reply(first, save_voucher=str(saved))
+    second_voucher = data["voucher"]
+    data, _, _ = agent_send(tmp_path, "neil", "/voucher new")
+    saved.write_text(data["voucher"] + "\n")
+    with pytest.raises(client.ClientError, match="outstanding request"):
+        client.open_reply(first, save_voucher=str(saved))   # delayed duplicate of reply 1
+    assert saved.read_text().strip() == data["voucher"] != second_voucher
