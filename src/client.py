@@ -1,7 +1,7 @@
 """Agent side: pin the vault key, /connect with a throwaway key, seal commands, open replies."""
 import base64
 import contextlib
-import fcntl
+import errno
 import hashlib
 import json
 import os
@@ -9,6 +9,12 @@ import shutil
 import subprocess
 import tempfile
 import time
+
+try:
+    import fcntl
+except ImportError:   # Windows: no fcntl, lock with msvcrt instead (see _lock_fd)
+    fcntl = None
+    import msvcrt
 
 import crypto
 from handler import ATTACHED, UNAVAILABLE, split_message
@@ -162,10 +168,41 @@ def _reply_lock():
     _ensure_dir()
     fd = os.open(_path("reply.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        _lock_fd(fd)
+        try:
+            yield
+        finally:
+            _unlock_fd(fd)
     finally:
         os.close(fd)
+
+
+_LOCK_BUSY = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+
+
+def _lock_fd(fd):
+    """Block until this process holds the exclusive lock on fd."""
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    # msvcrt.locking locks bytes from the current position. LK_LOCK retries for
+    # about 10 seconds and then raises EDEADLOCK, so keep waiting on that error.
+    while True:
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            return
+        except OSError as exc:
+            if exc.errno != _LOCK_BUSY:
+                raise
+
+
+def _unlock_fd(fd):
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 def _write_private(path, data):
@@ -174,7 +211,8 @@ def _write_private(path, data):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".a8s-vault-")
     try:
         with os.fdopen(fd, "wb") as handle:
-            os.fchmod(handle.fileno(), 0o600)
+            if hasattr(os, "fchmod"):   # absent on Windows before Python 3.13
+                os.fchmod(handle.fileno(), 0o600)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())

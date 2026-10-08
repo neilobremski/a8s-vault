@@ -1,10 +1,16 @@
 """End-to-end through handler + client with a fake `tell` that records what it would send."""
 import base64
+import errno
+import fcntl
+import importlib.util
 import json
 import os
 import stat
+import subprocess
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -356,3 +362,62 @@ def test_send_survives_reply_completed_during_pruning(env, monkeypatch):
     assert opened and opened[0]["ok"]
     _, reply_b = wake(tmp_path, "neil", body_b)
     assert client.open_reply(reply_b)[0]["ok"]
+
+
+SRC = os.path.dirname(os.path.abspath(client.__file__))
+
+
+def test_cli_starts_without_fcntl():
+    """Windows has no fcntl; the CLI (which imports client) must still start.
+    subprocess is imported first: it treats an importable msvcrt as Windows."""
+    prelude = ("import runpy, subprocess, sys, types; sys.modules['fcntl'] = None; "
+               "m = types.ModuleType('msvcrt'); m.LK_LOCK, m.LK_UNLCK = 1, 0; "
+               "m.locking = lambda fd, mode, n: None; sys.modules['msvcrt'] = m; "
+               "sys.argv = ['a8s-vault', '--help']; "
+               f"runpy.run_path({os.path.join(SRC, '__main__.py')!r}, run_name='__main__')")
+    run = subprocess.run([sys.executable, "-c", prelude], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert "usage" in run.stdout.lower()
+
+
+def test_windows_reply_lock_is_exclusive(env, monkeypatch):
+    """The msvcrt path, with a fake msvcrt that behaves like LK_LOCK: it gives up
+    with EDEADLOCK while another handle holds the byte, and the client retries."""
+    busy = []
+
+    def locking(fd, mode, nbytes):
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 0 and nbytes == 1
+        if mode == 0:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            busy.append(fd)
+            time.sleep(0.05)
+            raise OSError(getattr(errno, "EDEADLOCK", errno.EDEADLK), "busy") from None
+
+    fake = types.ModuleType("msvcrt")
+    fake.LK_LOCK, fake.LK_UNLCK, fake.locking = 1, 0, locking
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    spec = importlib.util.spec_from_file_location("client_windows", client.__file__)
+    win = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(win)
+    assert win.fcntl is None and win.msvcrt is fake
+
+    order = []
+
+    def second():
+        with win._reply_lock():
+            order.append("b")
+
+    with win._reply_lock():
+        order.append("a")
+        b = threading.Thread(target=second)
+        b.start()
+        b.join(0.5)
+        assert b.is_alive() and busy             # B was refused and is still retrying
+        order.append("a-done")
+    b.join(10)
+    assert order == ["a", "a-done", "b"]
