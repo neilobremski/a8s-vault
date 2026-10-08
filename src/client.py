@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -68,9 +69,10 @@ def pin(pem_path, expected=None):
 def connect(to):
     _pinned()
     _ensure_dir()
-    for name in ("conn.key", "conn.pem", "pending.json"):
+    for name in ("conn.key", "conn.pem"):
         if os.path.exists(_path(name)):
             os.unlink(_path(name))
+    shutil.rmtree(_path("pending"), ignore_errors=True)
     crypto.generate_key(_path("conn.key"))
     with open(_path("conn.pem"), "wb") as handle:
         handle.write(crypto.public_pem(_path("conn.key")))
@@ -78,17 +80,40 @@ def connect(to):
     return crypto.fingerprint(crypto.public_pem(_path("conn.key")))
 
 
-def _pending(update=None):
-    """Nonces of requests sent on this connection whose reply has not been applied yet."""
-    path = _path("pending.json")
+PENDING_KEEP = 200
+
+
+def _pending_path(nonce):
+    if not nonce or not all(c in "0123456789abcdef" for c in nonce):
+        raise ClientError("malformed nonce")
+    return _path(os.path.join("pending", nonce))
+
+
+def _pending_add(nonce):
+    """One empty file per outstanding request, so sends and reply handling never
+    read-modify-write a shared list; the file is removed only once the reply's
+    effects (voucher saved, files written) have succeeded."""
+    folder = _path("pending")
+    os.makedirs(folder, exist_ok=True)
+    with open(_pending_path(nonce), "x"):
+        pass
+    names = sorted(os.listdir(folder), key=lambda n: os.stat(os.path.join(folder, n)).st_mtime)
+    for stale in names[:-PENDING_KEEP]:
+        try:
+            os.unlink(os.path.join(folder, stale))
+        except FileNotFoundError:
+            pass
+
+
+def _pending_has(nonce):
+    return os.path.exists(_pending_path(nonce))
+
+
+def _pending_done(nonce):
     try:
-        with open(path) as handle:
-            nonces = json.load(handle)
-    except (FileNotFoundError, ValueError):
-        nonces = []
-    if update is not None:
-        _save_atomic(path, json.dumps(update(nonces)))
-    return nonces
+        os.unlink(_pending_path(nonce))
+    except FileNotFoundError:
+        pass
 
 
 def seal_command(cmd, file_path=None):
@@ -111,7 +136,7 @@ def seal_command(cmd, file_path=None):
            "nonce": os.urandom(16).hex(), "files": declared}
     signed = json.dumps(req)
     sig = base64.b64encode(crypto.sign(_path("conn.key"), signed.encode())).decode()
-    _pending(lambda nonces: [*nonces[-200:], req["nonce"]])
+    _pending_add(req["nonce"])
     payload = json.dumps({"req": signed, "sig": sig}).encode()
     return crypto.to_wire(crypto.seal(vault_pem, payload)), files
 
@@ -148,22 +173,26 @@ def open_reply(message, out_dir=None, save_voucher=None, extra_files=()):
     if nonce is None:
         if reply.get("op") not in ("connect", "disconnected"):
             raise ClientError("reply carries no request nonce; ignoring it")
-    elif nonce not in _pending():
+    elif not _pending_has(str(nonce)):
         raise ClientError("reply does not match an outstanding request (replayed, or already "
                           "applied); nothing changed")
     mapping = reply.get("files") if isinstance(reply.get("files"), dict) else {}
     outputs = _verified_attachments(mapping if reply.get("cmd") == "/retrieve" else {},
                                     files, missing, out_dir or ".")
+    try:
+        if save_voucher and reply.get("voucher"):
+            _save_atomic(save_voucher, reply["voucher"])
+        written = []
+        for target, plain in outputs:
+            os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(plain)
+            written.append(target)
+    except OSError as exc:
+        raise ClientError(f"could not apply the reply ({exc}); the request stays outstanding, "
+                          "fix the path and open the same reply again") from exc
     if nonce is not None:
-        _pending(lambda nonces: [n for n in nonces if n != nonce])
-    if save_voucher and reply.get("voucher"):
-        _save_atomic(save_voucher, reply["voucher"])
-    written = []
-    for target, plain in outputs:
-        os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
-        with open(target, "wb") as handle:
-            handle.write(plain)
-        written.append(target)
+        _pending_done(str(nonce))
     return reply, None, written
 
 

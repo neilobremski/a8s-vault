@@ -210,7 +210,9 @@ Considered and rejected for v1:
   `conn_pem` before dispatching. Each signed reply echoes the request nonce,
   and `/retrieve` replies carry the sha256 of every sealed attachment. The
   client keeps its outstanding nonces, refuses a reply it did not ask for or
-  has already applied (so a delayed duplicate cannot rewind the saved voucher),
+  has already applied (one record per nonce, removed only after the voucher or
+  files have been written, so a delayed duplicate cannot rewind the saved
+  voucher and a failed write stays retryable),
   and writes nothing unless every declared attachment is present and matches.
 
 ## 5. Prototype evidence (OpenSSL 3.0.2 and LibreSSL 3.3.6, both directions)

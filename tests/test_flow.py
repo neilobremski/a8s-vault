@@ -222,3 +222,32 @@ def test_replayed_auth_reply_does_not_rewind_voucher(env):
     with pytest.raises(client.ClientError, match="outstanding request"):
         client.open_reply(first, save_voucher=str(saved))   # delayed duplicate of reply 1
     assert saved.read_text().strip() == data["voucher"] != second_voucher
+
+
+def test_failed_voucher_save_keeps_reply_retryable(env):
+    tmp_path, v = env
+    with v.db:
+        voucher = v.issue("neil")
+    connect(tmp_path, "neil")
+    body, _ = client.seal_command(f"/authenticate {voucher}")
+    _, reply = wake(tmp_path, "neil", body)
+    durable = tmp_path / "durable" / "voucher"            # parent does not exist yet
+    with pytest.raises(client.ClientError, match="stays outstanding"):
+        client.open_reply(reply, save_voucher=str(durable))
+    assert not durable.exists()
+    durable.parent.mkdir()
+    data, _, _ = client.open_reply(reply, save_voucher=str(durable))   # same reply, retried
+    assert durable.read_text().strip() == data["voucher"]
+    with pytest.raises(client.ClientError, match="outstanding request"):
+        client.open_reply(reply, save_voucher=str(durable))   # and only once
+
+
+def test_interleaved_send_and_open_keep_both_requests(env):
+    tmp_path, v = env
+    _authed(tmp_path, v)
+    body_a, _ = client.seal_command("/voucher list")
+    _, reply_a = wake(tmp_path, "neil", body_a)
+    body_b, _ = client.seal_command("/voucher list")      # sent while reply A is still unopened
+    assert client.open_reply(reply_a)[0]["ok"]
+    _, reply_b = wake(tmp_path, "neil", body_b)
+    assert client.open_reply(reply_b)[0]["ok"]            # B's record survived opening A
