@@ -201,7 +201,8 @@ Considered and rejected for v1:
   on its command line, so on a shared host another Unix user can read a
   per-message key from `/proc/<pid>/cmdline` while it runs. The dedicated user
   protects files, not process listings: give the vault its own container or
-  VM, or mount `/proc` with `hidepid=2`.
+  VM, or mount `/proc` with `hidepid=2`. Accepted as-is for v1; hardening (keying
+  `enc` without argv) is deferred until the vault has run for real.
 
 ## 5. Prototype evidence (OpenSSL 3.0.2 and LibreSSL 3.3.6, both directions)
 
