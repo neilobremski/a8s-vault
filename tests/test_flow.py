@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import stat
+import threading
 import time
 
 import pytest
@@ -251,3 +252,107 @@ def test_interleaved_send_and_open_keep_both_requests(env):
     assert client.open_reply(reply_a)[0]["ok"]
     _, reply_b = wake(tmp_path, "neil", body_b)
     assert client.open_reply(reply_b)[0]["ok"]            # B's record survived opening A
+
+
+def _mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def test_restored_secrets_are_owner_only(env):
+    tmp_path, v = env
+    _authed(tmp_path, v)
+    src = tmp_path / "id_rsa"
+    src.write_text("PRIVATE KEY")
+    src.chmod(0o600)
+    assert agent_send(tmp_path, "neil", "/store keys/id_rsa", str(src))[0]["ok"]
+    old = os.umask(0o022)
+    try:
+        body, _ = client.seal_command("/retrieve keys/id_rsa")
+        _, reply = wake(tmp_path, "neil", body)
+        fresh = tmp_path / "restore" / "new"                     # nothing below tmp_path exists
+        _, _, written = client.open_reply(reply, out_dir=str(fresh))
+        assert written == [str(fresh / "keys" / "id_rsa")]
+        assert _mode(written[0]) == 0o600
+        for d in (tmp_path / "restore", fresh, fresh / "keys"):
+            assert _mode(d) == 0o700
+
+        existing = tmp_path / "existing" / "keys" / "id_rsa"     # replaced, not left at 0644
+        existing.parent.mkdir(parents=True)
+        existing.write_text("old")
+        existing.chmod(0o644)
+        body, _ = client.seal_command("/retrieve keys/id_rsa")
+        _, reply = wake(tmp_path, "neil", body)
+        client.open_reply(reply, out_dir=str(tmp_path / "existing"))
+        assert existing.read_text() == "PRIVATE KEY" and _mode(existing) == 0o600
+        assert _mode(existing.parent) == 0o755                  # caller's own dir untouched
+    finally:
+        os.umask(old)
+
+
+def test_overlapping_duplicate_opens_apply_once(env, monkeypatch):
+    """Opener A pauses just before saving the voucher; duplicate opener B of the same
+    reply must wait for A and then refuse, never apply it a second time."""
+    tmp_path, v = env
+    with v.db:
+        voucher = v.issue("neil")
+    connect(tmp_path, "neil")
+    body, _ = client.seal_command(f"/authenticate {voucher}")
+    _, reply = wake(tmp_path, "neil", body)
+    durable = tmp_path / "voucher"
+    paused, resume = threading.Event(), threading.Event()
+    real_write = client._write_private
+
+    def pause_first_write(path, data):
+        if not paused.is_set():
+            paused.set()
+            assert resume.wait(10)
+        real_write(path, data)
+
+    monkeypatch.setattr(client, "_write_private", pause_first_write)
+    results = {}
+
+    def opener(tag):   # flock contends per open file, so threads model separate processes
+        try:
+            results[tag] = client.open_reply(reply, save_voucher=str(durable))[0]
+        except client.ClientError as exc:
+            results[tag] = exc
+
+    a = threading.Thread(target=opener, args=("a",))
+    a.start()
+    assert paused.wait(10)                   # A passed the pending check, voucher not saved
+    b = threading.Thread(target=opener, args=("b",))
+    b.start()
+    b.join(1.0)
+    assert b.is_alive() and "b" not in results   # B is held at the lock, not applying
+    resume.set()
+    a.join(10)
+    b.join(10)
+    assert results["a"]["ok"]
+    assert isinstance(results["b"], client.ClientError)
+    assert "outstanding request" in str(results["b"])
+    assert durable.read_text().strip() == results["a"]["voucher"]
+
+
+def test_send_survives_reply_completed_during_pruning(env, monkeypatch):
+    """A reply is opened (its pending file unlinked) after the send's listdir and
+    before its stat; the send must still go out and its own reply still open."""
+    tmp_path, v = env
+    _authed(tmp_path, v)
+    body_a, _ = client.seal_command("/voucher list")
+    _, reply_a = wake(tmp_path, "neil", body_a)
+    real_listdir = os.listdir
+    opened = []
+
+    def listdir_then_complete(path):
+        names = real_listdir(path)
+        if path == client._path("pending") and not opened:
+            assert len(names) == 2
+            opened.append(client.open_reply(reply_a)[0])   # unlinks A's record mid-prune
+        return names
+
+    monkeypatch.setattr(os, "listdir", listdir_then_complete)
+    body_b, _ = client.seal_command("/voucher list")
+    monkeypatch.setattr(os, "listdir", real_listdir)
+    assert opened and opened[0]["ok"]
+    _, reply_b = wake(tmp_path, "neil", body_b)
+    assert client.open_reply(reply_b)[0]["ok"]

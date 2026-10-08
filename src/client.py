@@ -1,5 +1,7 @@
 """Agent side: pin the vault key, /connect with a throwaway key, seal commands, open replies."""
 import base64
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -97,8 +99,13 @@ def _pending_add(nonce):
     os.makedirs(folder, exist_ok=True)
     with open(_pending_path(nonce), "x"):
         pass
-    names = sorted(os.listdir(folder), key=lambda n: os.stat(os.path.join(folder, n)).st_mtime)
-    for stale in names[:-PENDING_KEEP]:
+    stamps = []
+    for name in os.listdir(folder):
+        try:
+            stamps.append((os.stat(os.path.join(folder, name)).st_mtime, name))
+        except FileNotFoundError:
+            continue   # completed by a concurrent `client open` after listdir saw it
+    for _, stale in sorted(stamps)[:-PENDING_KEEP]:
         try:
             os.unlink(os.path.join(folder, stale))
         except FileNotFoundError:
@@ -146,14 +153,50 @@ def send(to, cmd, file_path=None):
     _tell(to, body, files)
 
 
-def _save_atomic(path, text):
-    tmp = f"{path}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(text + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+@contextlib.contextmanager
+def _reply_lock():
+    """Exclusive across client processes. Checking a reply's nonce, applying its
+    effects and consuming the nonce happen under one lock, so two `client open`
+    runs of the same reply cannot both pass the check and the later one cannot
+    write back a voucher the vault has already burned. Released on close/exit."""
+    _ensure_dir()
+    fd = os.open(_path("reply.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _write_private(path, data):
+    """Write bytes owner-only (0600) whatever the umask or an existing file's mode:
+    a private temp file beside the target, fsynced, then renamed over it."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".a8s-vault-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
+def _makedirs_private(path):
+    """Create missing directories as 0700; existing ones are left alone. os.makedirs
+    applies its mode to the leaf only, and through the umask, so each new level is
+    created and chmod'ed here."""
+    if os.path.isdir(path):
+        return
+    _makedirs_private(os.path.dirname(path))
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        return
+    os.chmod(path, 0o700)
 
 
 def open_reply(message, out_dir=None, save_voucher=None, extra_files=()):
@@ -170,29 +213,28 @@ def open_reply(message, out_dir=None, save_voucher=None, extra_files=()):
         raise ClientError("reply signature does not verify against the pinned vault key")
     reply = json.loads(payload["body"])
     nonce = reply.get("nonce")
-    if nonce is None:
-        if reply.get("op") not in ("connect", "disconnected"):
-            raise ClientError("reply carries no request nonce; ignoring it")
-    elif not _pending_has(str(nonce)):
-        raise ClientError("reply does not match an outstanding request (replayed, or already "
-                          "applied); nothing changed")
-    mapping = reply.get("files") if isinstance(reply.get("files"), dict) else {}
-    outputs = _verified_attachments(mapping if reply.get("cmd") == "/retrieve" else {},
-                                    files, missing, out_dir or ".")
-    try:
-        if save_voucher and reply.get("voucher"):
-            _save_atomic(save_voucher, reply["voucher"])
-        written = []
-        for target, plain in outputs:
-            os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
-            with open(target, "wb") as handle:
-                handle.write(plain)
-            written.append(target)
-    except OSError as exc:
-        raise ClientError(f"could not apply the reply ({exc}); the request stays outstanding, "
-                          "fix the path and open the same reply again") from exc
-    if nonce is not None:
-        _pending_done(str(nonce))
+    if nonce is None and reply.get("op") not in ("connect", "disconnected"):
+        raise ClientError("reply carries no request nonce; ignoring it")
+    with _reply_lock():
+        if nonce is not None and not _pending_has(str(nonce)):
+            raise ClientError("reply does not match an outstanding request (replayed, or "
+                              "already applied); nothing changed")
+        mapping = reply.get("files") if isinstance(reply.get("files"), dict) else {}
+        outputs = _verified_attachments(mapping if reply.get("cmd") == "/retrieve" else {},
+                                        files, missing, out_dir or ".")
+        try:
+            if save_voucher and reply.get("voucher"):
+                _write_private(save_voucher, (reply["voucher"] + "\n").encode())
+            written = []
+            for target, plain in outputs:   # restored secrets: 0600 files, new dirs 0700
+                _makedirs_private(os.path.dirname(os.path.abspath(target)))
+                _write_private(target, plain)
+                written.append(target)
+        except OSError as exc:
+            raise ClientError(f"could not apply the reply ({exc}); the request stays "
+                              "outstanding, fix the path and open the same reply again") from exc
+        if nonce is not None:
+            _pending_done(str(nonce))
     return reply, None, written
 
 
