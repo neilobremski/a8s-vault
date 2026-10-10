@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Run the test suite in a venv beside it, so pytest never lands in the system
+# or Homebrew python. Arguments pass through: tests/run -q -k resolve
+set -euo pipefail
+
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$TESTS_DIR/.venv"
+
+if [ ! -x "$VENV/bin/python" ]; then
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install --quiet --upgrade pip
+  "$VENV/bin/pip" install --quiet pytest
+fi
+
+exec "$VENV/bin/python" -m pytest "$TESTS_DIR" "$@"

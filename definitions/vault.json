@@ -1,0 +1,17 @@
+{
+  "description": "Encrypted storage seat. Agents /connect with a throwaway public key, unlock their seat's container with a single-use voucher, then list/store/retrieve/delete files; every message after /connect is sealed. Register with the launcher path as a per-node var, e.g. `a8s add vault ~/vault-seat vault --A8S_VAULT=/path/to/a8s-vault`. Run it as a dedicated Unix user and `a8s-vault init` first.",
+  "invoke": [
+    "$A8S_VAULT",
+    "handle",
+    "--seat",
+    "$RECIPIENT",
+    "--from",
+    "$SENDER",
+    "--message",
+    "$MESSAGE"
+  ],
+  "max_wake_seconds": 300,
+  "idle": {
+    "timeout": 0
+  }
+}
